@@ -42,6 +42,7 @@ last_run: dict[str, Any] = {"status": "idle", "scanned": 0, "updated": 0, "skipp
 DEFAULT_SETTINGS = {"path": "/music", "schedule_enabled": True, "interval_minutes": 360, "overwrite": False, "sources": ["QM", "KG", "NE", "LRCLIB"], "min_score": 55, "duration_filter": True, "save_mode": "sidecar", "save_path": "/music", "lyrics_format": "verbatim", "filename_template": "%title% - %artist%"}
 settings_file = STATE / "settings.json"
 auth_file = STATE / "auth.json"
+history_file = STATE / "scrape-history.json"
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "14400"))
 ALLOWED_ROOTS = [Path(item).resolve() for item in os.getenv("ALLOWED_ROOTS", "/music,/data,/lyrics").split(",") if item]
 sessions: dict[str, float] = {}
@@ -114,6 +115,35 @@ def save_settings(value: dict[str, Any]) -> dict[str, Any]:
     return result
 
 app_settings = load_settings()
+
+
+def now_text() -> str:
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def result_item(level: str, message: str) -> dict[str, str]:
+    return {"time": now_text(), "level": level, "message": message}
+
+
+def load_history() -> list[dict[str, Any]]:
+    try:
+        value = json.loads(history_file.read_text(encoding="utf-8"))
+        return value if isinstance(value, list) else []
+    except Exception:
+        return []
+
+
+def save_history(run: dict[str, Any]) -> None:
+    history = load_history()
+    history.append(run)
+    temp = history_file.with_suffix(".tmp")
+    temp.write_text(json.dumps(history[-100:], ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(history_file)
+
+
+saved_history = load_history()
+if saved_history:
+    last_run = saved_history[-1]
 
 class ScanRequest(BaseModel):
     path: str | None = None
@@ -299,7 +329,7 @@ def render_filename(template: str, media: Path, info: SongInfo) -> str:
     return safe_name(name) + ".lrc"
 
 
-def scan_sync(request: ScanRequest) -> dict[str, Any]:
+def scan_sync(request: ScanRequest, trigger: str = "manual") -> dict[str, Any]:
     global last_run
     active = load_settings()
     root = ensure_allowed_path(Path(request.path or active["path"]))
@@ -314,36 +344,52 @@ def scan_sync(request: ScanRequest) -> dict[str, Any]:
     if not root.exists() or not root.is_dir():
         raise ValueError(f"目录不存在: {root}")
     scanned = updated = skipped = failed = 0
-    results: list[str] = []
+    results: list[dict[str, str]] = []
     targets: dict[Path, Path] = {}
     for path in root.rglob("*"):
         # Synology creates @eaDir sidecar folders. They are not user music and
         # must never be scanned or reported as failed songs.
         if any(part.startswith("@eaDir") for part in path.parts):
             continue
+        if path.is_symlink():
+            continue
         if path.is_file() and path.suffix.lower() in AUDIO_EXTS:
             targets[path.with_suffix(".lrc")] = path
 
+    total = len(targets)
+    started_at = datetime.now(timezone.utc).isoformat()
+    last_run = {"status": "running", "trigger": trigger, "scanned": total, "processed": 0, "updated": 0, "skipped": 0, "failed": 0, "results": [result_item("info", f"开始扫描：共 {total} 首音乐；成功 0，失败 0，存在跳过 0")], "at": started_at}
+
     for lrc, media in targets.items():
-        scanned += 1
         rel = str(media.relative_to(root))
         try:
-            if lrc.exists() and not overwrite and is_verbatim(read_text(lrc)):
-                skipped += 1
-                results.append(f"已跳过：{rel} 已是逐词歌词")
-                continue
             info = song_info(media)
-            lyrics = choose_lyrics(info, source_names, min_score, duration_filter)
             target = lrc if save_mode == "sidecar" else save_path / render_filename(filename_template, media, info)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(lyrics_to_lrc(lyrics, lyrics_format), encoding="utf-8")
-            updated += 1
-            results.append(f"成功：{rel} -> {target.name}")
+            if target.exists() and not overwrite and is_verbatim(read_text(target)):
+                skipped += 1
+                results.append(result_item("skip", f"{rel} 已存在逐词歌词：{target}"))
+            else:
+                lyrics = choose_lyrics(info, source_names, min_score, duration_filter)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                content = lyrics_to_lrc(lyrics, lyrics_format)
+                temp = target.with_suffix(target.suffix + ".tmp")
+                temp.write_text(content, encoding="utf-8")
+                temp.replace(target)
+                if not target.is_file() or target.stat().st_size == 0:
+                    raise OSError(f"歌词写入后校验失败: {target}")
+                updated += 1
+                results.append(result_item("ok", f"{rel} -> {target}"))
+                log.info("Saved lyrics: %s -> %s (%d bytes)", rel, target, target.stat().st_size)
         except Exception:
             failed += 1
-            results.append(f"失败：{rel}")
+            results.append(result_item("fail", rel))
             log.exception("Failed to scrape lyrics for %s", rel)
-    last_run = {"status": "done", "scanned": scanned, "updated": updated, "skipped": skipped, "failed": failed, "results": results, "at": datetime.now(timezone.utc).isoformat()}
+        last_run.update(processed=updated + skipped + failed, updated=updated, skipped=skipped, failed=failed, results=[last_run["results"][0], *results])
+
+    results.append(result_item("info", f"扫描完成：共 {total} 首音乐；成功 {updated}，失败 {failed}，存在跳过 {skipped}"))
+    last_run = {"status": "done", "trigger": trigger, "scanned": total, "processed": total, "updated": updated, "skipped": skipped, "failed": failed, "results": [last_run["results"][0], *results], "at": started_at, "finished_at": datetime.now(timezone.utc).isoformat()}
+    save_history(last_run)
+    log.info("Scan completed: trigger=%s total=%d success=%d failed=%d skipped=%d", trigger, total, updated, failed, skipped)
     return last_run
 
 
@@ -355,10 +401,16 @@ def scheduled_scan() -> None:
             threading.Event().wait(60)
             continue
         try:
-            scan_sync(ScanRequest())
+            if lock.acquire(blocking=False):
+                try:
+                    scan_sync(ScanRequest(), trigger="scheduled")
+                finally:
+                    lock.release()
+            else:
+                log.info("Scheduled scan skipped because another scan is running")
         except Exception:
             log.exception("Scheduled scan failed")
-            last_run.update(status="error", results=["失败：定时扫描异常，详细信息见 Docker 日志"], at=datetime.now(timezone.utc).isoformat())
+            last_run.update(status="error", results=[result_item("fail", "定时扫描异常，详细信息见 Docker 日志")], at=datetime.now(timezone.utc).isoformat())
         threading.Event().wait(interval * 60)
 
 @app.on_event("startup")
@@ -406,6 +458,10 @@ async def status(_: None = Depends(require_auth)) -> dict[str, Any]:
 async def get_settings(_: None = Depends(require_auth)) -> dict[str, Any]:
     return load_settings()
 
+@app.get("/api/history")
+async def get_history(_: None = Depends(require_auth)) -> list[dict[str, Any]]:
+    return list(reversed(load_history()))
+
 @app.put("/api/settings")
 async def put_settings(value: dict[str, Any], _: None = Depends(require_auth)) -> dict[str, Any]:
     global app_settings
@@ -430,7 +486,7 @@ async def scan(request: ScanRequest, _: None = Depends(require_auth)) -> dict[st
     if lock.locked():
         raise HTTPException(409, "已有扫描任务正在运行")
     with lock:
-        return await asyncio.to_thread(scan_sync, request)
+        return await asyncio.to_thread(scan_sync, request, "manual")
 
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
