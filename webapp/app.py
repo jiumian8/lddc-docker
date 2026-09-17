@@ -2,18 +2,23 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import Cookie, Depends, FastAPI, HTTPException, Response
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -28,7 +33,7 @@ ROOT = Path(os.getenv("MUSIC_ROOT", "/music")).resolve()
 STATE = Path(os.getenv("STATE_DIR", "/data")).resolve()
 STATE.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="LDDC Docker", version="1.0.0")
+app = FastAPI(title="LDDC MUSIC", version="1.0.0")
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 lock = threading.Lock()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
@@ -36,6 +41,65 @@ log = logging.getLogger("lddc-docker")
 last_run: dict[str, Any] = {"status": "idle", "scanned": 0, "updated": 0, "skipped": 0, "failed": 0, "results": [], "at": None}
 DEFAULT_SETTINGS = {"path": "/music", "schedule_enabled": True, "interval_minutes": 360, "overwrite": False, "sources": ["QM", "KG", "NE", "LRCLIB"], "min_score": 55, "duration_filter": True, "save_mode": "sidecar", "save_path": "/music", "lyrics_format": "verbatim", "filename_template": "%title% - %artist%"}
 settings_file = STATE / "settings.json"
+auth_file = STATE / "auth.json"
+SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "14400"))
+ALLOWED_ROOTS = [Path(item).resolve() for item in os.getenv("ALLOWED_ROOTS", "/music,/data,/lyrics").split(",") if item]
+sessions: dict[str, float] = {}
+
+class PasswordRequest(BaseModel):
+    password: str
+
+
+def password_hash(password: str, salt: bytes | None = None) -> dict[str, str | int]:
+    salt = salt or secrets.token_bytes(16)
+    rounds = 260000
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, rounds)
+    return {"algorithm": "pbkdf2_sha256", "rounds": rounds, "salt": base64.b64encode(salt).decode(), "hash": base64.b64encode(digest).decode()}
+
+
+def auth_config() -> dict[str, Any] | None:
+    try:
+        return json.loads(auth_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def verify_password(password: str) -> bool:
+    cfg = auth_config()
+    if not cfg:
+        return False
+    salt = base64.b64decode(cfg["salt"])
+    expected = base64.b64decode(cfg["hash"])
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(cfg["rounds"]))
+    return hmac.compare_digest(digest, expected)
+
+
+def create_session(response: Response) -> None:
+    token = secrets.token_urlsafe(32)
+    sessions[token] = time.time() + SESSION_TTL
+    response.set_cookie("lddc_session", token, max_age=SESSION_TTL, httponly=True, secure=os.getenv("COOKIE_SECURE", "false").lower() == "true", samesite="lax", path="/")
+
+
+def require_auth(lddc_session: str | None = Cookie(default=None)) -> None:
+    if not auth_file.exists():
+        raise HTTPException(401, "需要先设置管理员密码")
+    if not lddc_session or sessions.get(lddc_session, 0) < time.time():
+        raise HTTPException(401, "登录已过期")
+    sessions[lddc_session] = time.time() + SESSION_TTL
+
+
+def clear_session(response: Response, token: str | None) -> None:
+    if token:
+        sessions.pop(token, None)
+    response.delete_cookie("lddc_session", path="/")
+
+
+def ensure_allowed_path(path: Path) -> Path:
+    resolved = path.resolve()
+    if not any(resolved == root or root in resolved.parents for root in ALLOWED_ROOTS):
+        allowed = ", ".join(str(root) for root in ALLOWED_ROOTS)
+        raise ValueError(f"路径不在允许范围内: {resolved}; 允许范围: {allowed}")
+    return resolved
 
 def load_settings() -> dict[str, Any]:
     try:
@@ -238,13 +302,13 @@ def render_filename(template: str, media: Path, info: SongInfo) -> str:
 def scan_sync(request: ScanRequest) -> dict[str, Any]:
     global last_run
     active = load_settings()
-    root = Path(request.path or active["path"]).resolve()
+    root = ensure_allowed_path(Path(request.path or active["path"]))
     overwrite = active["overwrite"] if request.overwrite is None else request.overwrite
     source_names = active["sources"] if request.sources is None else request.sources
     min_score = int(active["min_score"] if request.min_score is None else request.min_score)
     duration_filter = bool(active["duration_filter"] if request.duration_filter is None else request.duration_filter)
     save_mode = active["save_mode"] if request.save_mode is None else request.save_mode
-    save_path = Path(active["save_path"] if request.save_path is None else request.save_path).resolve()
+    save_path = ensure_allowed_path(Path(active["save_path"] if request.save_path is None else request.save_path))
     lyrics_format = active["lyrics_format"] if request.lyrics_format is None else request.lyrics_format
     filename_template = active["filename_template"] if request.filename_template is None else request.filename_template
     if not root.exists() or not root.is_dir():
@@ -305,17 +369,45 @@ async def startup() -> None:
 async def index() -> FileResponse:
     return FileResponse(Path(__file__).parent / "static" / "index.html")
 
+@app.get("/api/auth/status")
+async def auth_status(lddc_session: str | None = Cookie(default=None)) -> dict[str, Any]:
+    configured = auth_file.exists()
+    authenticated = bool(configured and lddc_session and sessions.get(lddc_session, 0) >= time.time())
+    return {"configured": configured, "authenticated": authenticated, "session_ttl_seconds": SESSION_TTL}
+
+@app.post("/api/auth/setup")
+async def setup_auth(value: PasswordRequest, response: Response) -> dict[str, bool]:
+    if auth_file.exists():
+        raise HTTPException(409, "管理员密码已设置")
+    if len(value.password) < 8:
+        raise HTTPException(400, "密码至少 8 位")
+    auth_file.write_text(json.dumps(password_hash(value.password), ensure_ascii=False, indent=2), encoding="utf-8")
+    create_session(response)
+    return {"ok": True}
+
+@app.post("/api/auth/login")
+async def login(value: PasswordRequest, response: Response) -> dict[str, bool]:
+    if not verify_password(value.password):
+        raise HTTPException(401, "密码错误")
+    create_session(response)
+    return {"ok": True}
+
+@app.post("/api/auth/logout")
+async def logout(response: Response, lddc_session: str | None = Cookie(default=None)) -> dict[str, bool]:
+    clear_session(response, lddc_session)
+    return {"ok": True}
+
 @app.get("/api/status")
-async def status() -> dict[str, Any]:
+async def status(_: None = Depends(require_auth)) -> dict[str, Any]:
     active = load_settings()
     return {**last_run, "music_root": active["path"], "interval_minutes": active["interval_minutes"] if active["schedule_enabled"] else 0, "settings": active}
 
 @app.get("/api/settings")
-async def get_settings() -> dict[str, Any]:
+async def get_settings(_: None = Depends(require_auth)) -> dict[str, Any]:
     return load_settings()
 
 @app.put("/api/settings")
-async def put_settings(value: dict[str, Any]) -> dict[str, Any]:
+async def put_settings(value: dict[str, Any], _: None = Depends(require_auth)) -> dict[str, Any]:
     global app_settings
     value["interval_minutes"] = max(0, int(value.get("interval_minutes", 360)))
     value["min_score"] = min(100, max(0, int(value.get("min_score", 55))))
@@ -323,7 +415,8 @@ async def put_settings(value: dict[str, Any]) -> dict[str, Any]:
     value["overwrite"] = bool(value.get("overwrite", False))
     value["duration_filter"] = bool(value.get("duration_filter", True))
     value["save_mode"] = value.get("save_mode", "sidecar") if value.get("save_mode") in {"sidecar", "directory"} else "sidecar"
-    value["save_path"] = value.get("save_path") or DEFAULT_SETTINGS["save_path"]
+    value["path"] = str(ensure_allowed_path(Path(value.get("path") or DEFAULT_SETTINGS["path"])))
+    value["save_path"] = str(ensure_allowed_path(Path(value.get("save_path") or DEFAULT_SETTINGS["save_path"])))
     value["lyrics_format"] = value.get("lyrics_format", "verbatim") if value.get("lyrics_format") in {"verbatim", "enhanced", "line"} else "verbatim"
     value["filename_template"] = value.get("filename_template") or DEFAULT_SETTINGS["filename_template"]
     value["sources"] = [name for name in value.get("sources", []) if name in {"QM", "KG", "NE", "LRCLIB"}]
@@ -333,7 +426,7 @@ async def put_settings(value: dict[str, Any]) -> dict[str, Any]:
     return app_settings
 
 @app.post("/api/scan")
-async def scan(request: ScanRequest) -> dict[str, Any]:
+async def scan(request: ScanRequest, _: None = Depends(require_auth)) -> dict[str, Any]:
     if lock.locked():
         raise HTTPException(409, "已有扫描任务正在运行")
     with lock:
