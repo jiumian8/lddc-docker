@@ -31,7 +31,7 @@ app = FastAPI(title="LDDC Docker", version="1.0.0")
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 lock = threading.Lock()
 last_run: dict[str, Any] = {"status": "idle", "scanned": 0, "updated": 0, "errors": [], "at": None}
-DEFAULT_SETTINGS = {"path": "/music", "schedule_enabled": True, "interval_minutes": 360, "overwrite": False, "sources": ["QM", "KG", "NE", "LRCLIB"], "min_score": 55, "duration_filter": True}
+DEFAULT_SETTINGS = {"path": "/music", "schedule_enabled": True, "interval_minutes": 360, "overwrite": False, "sources": ["QM", "KG", "NE", "LRCLIB"], "min_score": 55, "duration_filter": True, "save_mode": "sidecar", "save_path": "/music", "lyrics_format": "verbatim"}
 settings_file = STATE / "settings.json"
 
 def load_settings() -> dict[str, Any]:
@@ -54,6 +54,9 @@ class ScanRequest(BaseModel):
     sources: list[str] | None = None
     min_score: int | None = None
     duration_filter: bool | None = None
+    save_mode: str | None = None
+    save_path: str | None = None
+    lyrics_format: str | None = None
 
 
 def is_verbatim(text: str) -> bool:
@@ -115,23 +118,28 @@ def timestamp(ms: int | None) -> str:
     return f"{value // 60000:02}:{value % 60000 // 1000:02}.{value % 1000:03}"
 
 
-def verbatim_lrc(lyrics: Any) -> str:
-    """Serialize LDDC's timed words without importing its Qt-bound config layer."""
+def lyrics_to_lrc(lyrics: Any, lyrics_format: str = "verbatim") -> str:
+    """Serialize LDDC's lyrics without importing its Qt-bound config layer."""
     tags = "\n".join(f"[{key}:{value}]" for key, value in lyrics.tags.items() if key in {"al", "ar", "au", "by", "offset", "ti"} and value)
     lines: list[str] = []
     for line in lyrics["orig"]:
         start = line.words[0].start if line.words and line.words[0].start is not None else line.start
+        if lyrics_format == "line":
+            lines.append(f"[{timestamp(start)}]" + "".join(word.text for word in line.words))
+            continue
+        enhanced = lyrics_format == "enhanced"
+        left, right = ("<", ">") if enhanced else ("[", "]")
         output = f"[{timestamp(start)}]"
-        last_end = start
+        last_end = None if enhanced else start
         for word in line.words:
             if word.start is not None and word.start != last_end:
-                output += f"[{timestamp(word.start)}]"
+                output += f"{left}{timestamp(word.start)}{right}"
             output += word.text
             if word.end is not None:
-                output += f"[{timestamp(word.end)}]"
+                output += f"{left}{timestamp(word.end)}{right}"
             last_end = word.end
-        if line.end is not None and not output.endswith("]"):
-            output += f"[{timestamp(line.end)}]"
+        if line.end is not None and not output.endswith(right):
+            output += f"{left}{timestamp(line.end)}{right}"
         lines.append(output)
     header = (tags + "\n") if tags else ""
     return header + "[tool:LDDC Docker]\n\n" + "\n".join(lines) + "\n"
@@ -214,6 +222,9 @@ def scan_sync(request: ScanRequest) -> dict[str, Any]:
     source_names = active["sources"] if request.sources is None else request.sources
     min_score = int(active["min_score"] if request.min_score is None else request.min_score)
     duration_filter = bool(active["duration_filter"] if request.duration_filter is None else request.duration_filter)
+    save_mode = active["save_mode"] if request.save_mode is None else request.save_mode
+    save_path = Path(active["save_path"] if request.save_path is None else request.save_path).resolve()
+    lyrics_format = active["lyrics_format"] if request.lyrics_format is None else request.lyrics_format
     if not root.exists() or not root.is_dir():
         raise ValueError(f"目录不存在: {root}")
     scanned = updated = 0
@@ -233,7 +244,9 @@ def scan_sync(request: ScanRequest) -> dict[str, Any]:
             if lrc.exists() and not overwrite and is_verbatim(read_text(lrc)):
                 continue
             lyrics = choose_lyrics(song_info(media), source_names, min_score, duration_filter)
-            lrc.write_text(verbatim_lrc(lyrics), encoding="utf-8")
+            target = lrc if save_mode == "sidecar" else save_path / media.relative_to(root).with_suffix(".lrc")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(lyrics_to_lrc(lyrics, lyrics_format), encoding="utf-8")
             updated += 1
         except Exception as exc:
             errors.append(f"{media.relative_to(root)}: {exc}")
@@ -279,6 +292,9 @@ async def put_settings(value: dict[str, Any]) -> dict[str, Any]:
     value["schedule_enabled"] = bool(value.get("schedule_enabled", False))
     value["overwrite"] = bool(value.get("overwrite", False))
     value["duration_filter"] = bool(value.get("duration_filter", True))
+    value["save_mode"] = value.get("save_mode", "sidecar") if value.get("save_mode") in {"sidecar", "directory"} else "sidecar"
+    value["save_path"] = value.get("save_path") or DEFAULT_SETTINGS["save_path"]
+    value["lyrics_format"] = value.get("lyrics_format", "verbatim") if value.get("lyrics_format") in {"verbatim", "enhanced", "line"} else "verbatim"
     value["sources"] = [name for name in value.get("sources", []) if name in {"QM", "KG", "NE", "LRCLIB"}]
     if not value["sources"]:
         value["sources"] = DEFAULT_SETTINGS["sources"]

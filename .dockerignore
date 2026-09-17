@@ -4,7 +4,9 @@ __pycache__
 .github
 img
 LDDC/gui
-LDDC/res
+LDDC/res/img
+LDDC/res/i18n
+LDDC/res/resource_rc.py
 music/*
 data/*
 lddc-docker
