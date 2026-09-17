@@ -5,6 +5,7 @@ import asyncio
 import os
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from LDDC.common.models import Artist, LyricsType, SearchType, Source, SongInfo
 from LDDC.core.api.lyrics import get_lyrics, search
 from LDDC.core.parser.lrc import lrc2data
 from LDDC.core.parser.utils import judge_lyrics_type
+from LDDC.core.algorithm import calculate_artist_score, calculate_title_score, text_difference
 
 AUDIO_EXTS = {".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".opus", ".wav", ".aac", ".wma", ".ape"}
 ROOT = Path(os.getenv("MUSIC_ROOT", "/music")).resolve()
@@ -108,24 +110,64 @@ def verbatim_lrc(lyrics: Any) -> str:
 
 
 def choose_lyrics(info: SongInfo, names: list[str]) -> Any:
-    for name in names:
-        source = Source[name]
+    """Match like the original auto_fetch: multi-source search, scoring and fallback."""
+    title = (info.title or "").strip()
+    artist_title = info.artist_title() if title and info.artist else title
+    filename = info.path.stem if info.path else title
+    queries = [query for query in (artist_title, title, filename) if query]
+    sources = [Source[name] for name in names if name in Source.__members__ and name != "Local"]
+    candidates: list[tuple[float, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def do_search(source: Source, query: str) -> list[Any]:
         try:
-            results = search(source, info.artist_title() or info.title or info.path.stem, SearchType.SONG)
-            candidates = list(results)
-            if not candidates:
-                continue
-            # API result order is already source-ranked; try the first two candidates.
-            for candidate in candidates[:2]:
-                try:
-                    lyrics = get_lyrics(candidate)
-                    if lyrics.types.get("orig") == LyricsType.VERBATIM:
-                        return lyrics
-                except Exception:
-                    continue
+            return list(search(source, query, SearchType.SONG))
         except Exception:
-            continue
-    raise RuntimeError("未找到逐词歌词")
+            return []
+
+    # Search every configured source and query concurrently, as the desktop app does.
+    with ThreadPoolExecutor(max_workers=max(1, len(sources) * 2)) as pool:
+        futures = [pool.submit(do_search, source, query) for source in sources for query in queries]
+        for future in as_completed(futures):
+            for result in future.result():
+                key = (result.source.name, str(result.id or result.title or ""))
+                if key in seen:
+                    continue
+                seen.add(key)
+                if info.duration and result.duration and abs(info.duration - result.duration) > 4000:
+                    continue
+                title_score = calculate_title_score(title, result.title or "") if title else 0
+                artist_score = None
+                if info.artist and result.artist:
+                    artist_score = calculate_artist_score(str(info.artist), str(result.artist))
+                album_score = None
+                if info.album and result.album:
+                    album_score = text_difference(info.album.lower(), result.album.lower()) * 100
+                if artist_score is not None:
+                    score = (max(title_score * .5 + artist_score * .5,
+                                  title_score * .5 + artist_score * .35 + (album_score or 0) * .15)
+                             if album_score is not None else title_score * .5 + artist_score * .5)
+                elif album_score is not None:
+                    score = max(title_score * .7 + album_score * .3, title_score * .8)
+                else:
+                    score = title_score
+                if title_score < 30:
+                    score = max(0, score - 35)
+                if score >= 55:
+                    candidates.append((score, result))
+
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    errors: list[Exception] = []
+    # Original code retries the best candidates; we try all scored candidates so
+    # an API's first non-verbatim result cannot hide a later verbatim result.
+    for _score, candidate in candidates:
+        try:
+            lyrics = get_lyrics(candidate)
+            if lyrics.types.get("orig") == LyricsType.VERBATIM:
+                return lyrics
+        except Exception as exc:
+            errors.append(exc)
+    raise RuntimeError(f"未找到逐词歌词（已尝试 {len(candidates)} 个候选）")
 
 
 def scan_sync(request: ScanRequest) -> dict[str, Any]:
@@ -137,10 +179,12 @@ def scan_sync(request: ScanRequest) -> dict[str, Any]:
     errors: list[str] = []
     targets: dict[Path, Path] = {}
     for path in root.rglob("*"):
-        if path.suffix.lower() in AUDIO_EXTS:
+        # Synology creates @eaDir sidecar folders. They are not user music and
+        # must never be scanned or reported as failed songs.
+        if any(part.startswith("@eaDir") for part in path.parts):
+            continue
+        if path.is_file() and path.suffix.lower() in AUDIO_EXTS:
             targets[path.with_suffix(".lrc")] = path
-        elif path.suffix.lower() == ".lrc":
-            targets.setdefault(path, path)
 
     for lrc, media in targets.items():
         scanned += 1
