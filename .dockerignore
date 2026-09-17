@@ -1,0 +1,10 @@
+__pycache__
+*.pyc
+.git
+.github
+img
+LDDC/gui
+LDDC/res
+music/*
+data/*
+tests
