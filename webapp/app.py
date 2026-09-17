@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import threading
@@ -30,11 +31,29 @@ app = FastAPI(title="LDDC Docker", version="1.0.0")
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 lock = threading.Lock()
 last_run: dict[str, Any] = {"status": "idle", "scanned": 0, "updated": 0, "errors": [], "at": None}
+DEFAULT_SETTINGS = {"path": "/music", "schedule_enabled": True, "interval_minutes": 360, "overwrite": False, "sources": ["QM", "KG", "NE", "LRCLIB"], "min_score": 55, "duration_filter": True}
+settings_file = STATE / "settings.json"
+
+def load_settings() -> dict[str, Any]:
+    try:
+        saved = json.loads(settings_file.read_text(encoding="utf-8"))
+        return {**DEFAULT_SETTINGS, **saved}
+    except Exception:
+        return DEFAULT_SETTINGS.copy()
+
+def save_settings(value: dict[str, Any]) -> dict[str, Any]:
+    result = {**DEFAULT_SETTINGS, **value}
+    settings_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
+
+app_settings = load_settings()
 
 class ScanRequest(BaseModel):
-    path: str = "/music"
-    overwrite: bool = False
-    sources: list[str] = Field(default_factory=lambda: ["QM", "KG", "NE", "LRCLIB"])
+    path: str | None = None
+    overwrite: bool | None = None
+    sources: list[str] | None = None
+    min_score: int | None = None
+    duration_filter: bool | None = None
 
 
 def is_verbatim(text: str) -> bool:
@@ -54,9 +73,18 @@ def read_text(path: Path) -> str:
 
 def fallback_info(audio: Path) -> SongInfo:
     name = audio.stem
-    parts = re.split(r"\s+-\s+", name, maxsplit=1)
-    artist, title = (parts[0], parts[1]) if len(parts) == 2 else (None, name)
-    return SongInfo(source=Source.Local, title=title, artist=Artist(artist) if artist else None, path=audio)
+    parts = [part.strip() for part in re.split(r"\s+-\s+", name) if part.strip()]
+    title, artist, album = name, None, None
+    if len(parts) >= 4 and parts[2].lower() in {"master", "hi-res", "hires", "lossless", "flac", "web"}:
+        # Common NAS naming: title - artist - quality - album
+        title, artist, album = parts[0], parts[1], " - ".join(parts[3:])
+    elif len(parts) >= 3:
+        # Prefer title - artist - album, but still support artist - title.
+        title, artist, album = parts[0], parts[1], " - ".join(parts[2:])
+    elif len(parts) == 2:
+        left, right = parts
+        title, artist = left, right
+    return SongInfo(source=Source.Local, title=title, artist=Artist(artist) if artist else None, album=album, path=audio)
 
 
 def song_info(audio: Path) -> SongInfo:
@@ -74,7 +102,7 @@ def song_info(audio: Path) -> SongInfo:
             source=Source.Local,
             title=first("title") or fallback.title,
             artist=Artist(first("artist")) if first("artist") else fallback.artist,
-            album=first("album"),
+            album=first("album") or fallback.album,
             duration=round(media.info.length * 1000),
             path=audio,
         )
@@ -109,7 +137,7 @@ def verbatim_lrc(lyrics: Any) -> str:
     return header + "[tool:LDDC Docker]\n\n" + "\n".join(lines) + "\n"
 
 
-def choose_lyrics(info: SongInfo, names: list[str]) -> Any:
+def choose_lyrics(info: SongInfo, names: list[str], min_score: int = 55, duration_filter: bool = True) -> Any:
     """Match like the original auto_fetch: multi-source search, scoring and fallback."""
     title = (info.title or "").strip()
     artist_title = info.artist_title() if title and info.artist else title
@@ -118,23 +146,29 @@ def choose_lyrics(info: SongInfo, names: list[str]) -> Any:
     sources = [Source[name] for name in names if name in Source.__members__ and name != "Local"]
     candidates: list[tuple[float, Any]] = []
     seen: set[tuple[str, str]] = set()
+    raw_count = 0
 
-    def do_search(source: Source, query: str) -> list[Any]:
+    search_errors: list[str] = []
+    def do_search(source: Source, query: str) -> tuple[list[Any], str | None]:
         try:
-            return list(search(source, query, SearchType.SONG))
-        except Exception:
-            return []
+            return list(search(source, query, SearchType.SONG)), None
+        except Exception as exc:
+            return [], f"{source.name}/{query}: {exc.__class__.__name__}: {exc}"
 
     # Search every configured source and query concurrently, as the desktop app does.
     with ThreadPoolExecutor(max_workers=max(1, len(sources) * 2)) as pool:
         futures = [pool.submit(do_search, source, query) for source in sources for query in queries]
         for future in as_completed(futures):
-            for result in future.result():
+            results, search_error = future.result()
+            if search_error:
+                search_errors.append(search_error)
+            for result in results:
+                raw_count += 1
                 key = (result.source.name, str(result.id or result.title or ""))
                 if key in seen:
                     continue
                 seen.add(key)
-                if info.duration and result.duration and abs(info.duration - result.duration) > 4000:
+                if duration_filter and info.duration and result.duration and abs(info.duration - result.duration) > 4000:
                     continue
                 title_score = calculate_title_score(title, result.title or "") if title else 0
                 artist_score = None
@@ -153,7 +187,7 @@ def choose_lyrics(info: SongInfo, names: list[str]) -> Any:
                     score = title_score
                 if title_score < 30:
                     score = max(0, score - 35)
-                if score >= 55:
+                if score >= min_score:
                     candidates.append((score, result))
 
     candidates.sort(key=lambda pair: pair[0], reverse=True)
@@ -167,12 +201,19 @@ def choose_lyrics(info: SongInfo, names: list[str]) -> Any:
                 return lyrics
         except Exception as exc:
             errors.append(exc)
-    raise RuntimeError(f"未找到逐词歌词（已尝试 {len(candidates)} 个候选）")
+    detail = "；".join(search_errors[:4])
+    meta = f"识别为：{info.artist_title() or info.title or filename}；专辑：{info.album or '-'}；搜索返回 {raw_count} 条，评分后 {len(candidates)} 条"
+    raise RuntimeError(f"未找到逐词歌词（已尝试 {len(candidates)} 个候选；{meta}）" + (f"；搜索错误：{detail}" if detail else ""))
 
 
 def scan_sync(request: ScanRequest) -> dict[str, Any]:
     global last_run
-    root = Path(request.path).resolve()
+    active = load_settings()
+    root = Path(request.path or active["path"]).resolve()
+    overwrite = active["overwrite"] if request.overwrite is None else request.overwrite
+    source_names = active["sources"] if request.sources is None else request.sources
+    min_score = int(active["min_score"] if request.min_score is None else request.min_score)
+    duration_filter = bool(active["duration_filter"] if request.duration_filter is None else request.duration_filter)
     if not root.exists() or not root.is_dir():
         raise ValueError(f"目录不存在: {root}")
     scanned = updated = 0
@@ -189,9 +230,9 @@ def scan_sync(request: ScanRequest) -> dict[str, Any]:
     for lrc, media in targets.items():
         scanned += 1
         try:
-            if lrc.exists() and not request.overwrite and is_verbatim(read_text(lrc)):
+            if lrc.exists() and not overwrite and is_verbatim(read_text(lrc)):
                 continue
-            lyrics = choose_lyrics(song_info(media), request.sources)
+            lyrics = choose_lyrics(song_info(media), source_names, min_score, duration_filter)
             lrc.write_text(verbatim_lrc(lyrics), encoding="utf-8")
             updated += 1
         except Exception as exc:
@@ -201,10 +242,12 @@ def scan_sync(request: ScanRequest) -> dict[str, Any]:
 
 
 def scheduled_scan() -> None:
-    interval = int(os.getenv("SCAN_INTERVAL_MINUTES", "0"))
-    if interval <= 0:
-        return
     while True:
+        active = load_settings()
+        interval = int(active.get("interval_minutes", 0)) if active.get("schedule_enabled") else 0
+        if interval <= 0:
+            threading.Event().wait(60)
+            continue
         try:
             scan_sync(ScanRequest())
         except Exception as exc:
@@ -221,7 +264,26 @@ async def index() -> FileResponse:
 
 @app.get("/api/status")
 async def status() -> dict[str, Any]:
-    return {**last_run, "music_root": str(ROOT), "interval_minutes": int(os.getenv("SCAN_INTERVAL_MINUTES", "0"))}
+    active = load_settings()
+    return {**last_run, "music_root": active["path"], "interval_minutes": active["interval_minutes"] if active["schedule_enabled"] else 0, "settings": active}
+
+@app.get("/api/settings")
+async def get_settings() -> dict[str, Any]:
+    return load_settings()
+
+@app.put("/api/settings")
+async def put_settings(value: dict[str, Any]) -> dict[str, Any]:
+    global app_settings
+    value["interval_minutes"] = max(0, int(value.get("interval_minutes", 360)))
+    value["min_score"] = min(100, max(0, int(value.get("min_score", 55))))
+    value["schedule_enabled"] = bool(value.get("schedule_enabled", False))
+    value["overwrite"] = bool(value.get("overwrite", False))
+    value["duration_filter"] = bool(value.get("duration_filter", True))
+    value["sources"] = [name for name in value.get("sources", []) if name in {"QM", "KG", "NE", "LRCLIB"}]
+    if not value["sources"]:
+        value["sources"] = DEFAULT_SETTINGS["sources"]
+    app_settings = save_settings(value)
+    return app_settings
 
 @app.post("/api/scan")
 async def scan(request: ScanRequest) -> dict[str, Any]:
