@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import threading
@@ -30,8 +31,10 @@ STATE.mkdir(parents=True, exist_ok=True)
 app = FastAPI(title="LDDC Docker", version="1.0.0")
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 lock = threading.Lock()
-last_run: dict[str, Any] = {"status": "idle", "scanned": 0, "updated": 0, "errors": [], "at": None}
-DEFAULT_SETTINGS = {"path": "/music", "schedule_enabled": True, "interval_minutes": 360, "overwrite": False, "sources": ["QM", "KG", "NE", "LRCLIB"], "min_score": 55, "duration_filter": True, "save_mode": "sidecar", "save_path": "/music", "lyrics_format": "verbatim"}
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("lddc-docker")
+last_run: dict[str, Any] = {"status": "idle", "scanned": 0, "updated": 0, "skipped": 0, "failed": 0, "results": [], "at": None}
+DEFAULT_SETTINGS = {"path": "/music", "schedule_enabled": True, "interval_minutes": 360, "overwrite": False, "sources": ["QM", "KG", "NE", "LRCLIB"], "min_score": 55, "duration_filter": True, "save_mode": "sidecar", "save_path": "/music", "lyrics_format": "verbatim", "filename_template": "%title% - %artist%"}
 settings_file = STATE / "settings.json"
 
 def load_settings() -> dict[str, Any]:
@@ -57,6 +60,7 @@ class ScanRequest(BaseModel):
     save_mode: str | None = None
     save_path: str | None = None
     lyrics_format: str | None = None
+    filename_template: str | None = None
 
 
 def is_verbatim(text: str) -> bool:
@@ -142,7 +146,7 @@ def lyrics_to_lrc(lyrics: Any, lyrics_format: str = "verbatim") -> str:
             output += f"{left}{timestamp(line.end)}{right}"
         lines.append(output)
     header = (tags + "\n") if tags else ""
-    return header + "[tool:LDDC Docker]\n\n" + "\n".join(lines) + "\n"
+    return header + "[tool:jiumian]\n\n" + "\n".join(lines) + "\n"
 
 
 def choose_lyrics(info: SongInfo, names: list[str], min_score: int = 55, duration_filter: bool = True) -> Any:
@@ -214,6 +218,23 @@ def choose_lyrics(info: SongInfo, names: list[str], min_score: int = 55, duratio
     raise RuntimeError(f"未找到逐词歌词（已尝试 {len(candidates)} 个候选；{meta}）" + (f"；搜索错误：{detail}" if detail else ""))
 
 
+def safe_name(value: str) -> str:
+    return re.sub(r"[\\/:*?\"<>|]", "_", value).strip() or "lyrics"
+
+
+def render_filename(template: str, media: Path, info: SongInfo) -> str:
+    values = {
+        "%title%": info.title or media.stem,
+        "%artist%": str(info.artist) if info.artist else "",
+        "%album%": info.album or "",
+        "%filename%": media.stem,
+    }
+    name = template or DEFAULT_SETTINGS["filename_template"]
+    for key, value in values.items():
+        name = name.replace(key, value)
+    return safe_name(name) + ".lrc"
+
+
 def scan_sync(request: ScanRequest) -> dict[str, Any]:
     global last_run
     active = load_settings()
@@ -225,10 +246,11 @@ def scan_sync(request: ScanRequest) -> dict[str, Any]:
     save_mode = active["save_mode"] if request.save_mode is None else request.save_mode
     save_path = Path(active["save_path"] if request.save_path is None else request.save_path).resolve()
     lyrics_format = active["lyrics_format"] if request.lyrics_format is None else request.lyrics_format
+    filename_template = active["filename_template"] if request.filename_template is None else request.filename_template
     if not root.exists() or not root.is_dir():
         raise ValueError(f"目录不存在: {root}")
-    scanned = updated = 0
-    errors: list[str] = []
+    scanned = updated = skipped = failed = 0
+    results: list[str] = []
     targets: dict[Path, Path] = {}
     for path in root.rglob("*"):
         # Synology creates @eaDir sidecar folders. They are not user music and
@@ -240,17 +262,24 @@ def scan_sync(request: ScanRequest) -> dict[str, Any]:
 
     for lrc, media in targets.items():
         scanned += 1
+        rel = str(media.relative_to(root))
         try:
             if lrc.exists() and not overwrite and is_verbatim(read_text(lrc)):
+                skipped += 1
+                results.append(f"已跳过：{rel} 已是逐词歌词")
                 continue
-            lyrics = choose_lyrics(song_info(media), source_names, min_score, duration_filter)
-            target = lrc if save_mode == "sidecar" else save_path / media.relative_to(root).with_suffix(".lrc")
+            info = song_info(media)
+            lyrics = choose_lyrics(info, source_names, min_score, duration_filter)
+            target = lrc if save_mode == "sidecar" else save_path / render_filename(filename_template, media, info)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(lyrics_to_lrc(lyrics, lyrics_format), encoding="utf-8")
             updated += 1
-        except Exception as exc:
-            errors.append(f"{media.relative_to(root)}: {exc}")
-    last_run = {"status": "done", "scanned": scanned, "updated": updated, "errors": errors, "at": datetime.now(timezone.utc).isoformat()}
+            results.append(f"成功：{rel} -> {target.name}")
+        except Exception:
+            failed += 1
+            results.append(f"失败：{rel}")
+            log.exception("Failed to scrape lyrics for %s", rel)
+    last_run = {"status": "done", "scanned": scanned, "updated": updated, "skipped": skipped, "failed": failed, "results": results, "at": datetime.now(timezone.utc).isoformat()}
     return last_run
 
 
@@ -263,8 +292,9 @@ def scheduled_scan() -> None:
             continue
         try:
             scan_sync(ScanRequest())
-        except Exception as exc:
-            last_run.update(status="error", errors=[str(exc)], at=datetime.now(timezone.utc).isoformat())
+        except Exception:
+            log.exception("Scheduled scan failed")
+            last_run.update(status="error", results=["失败：定时扫描异常，详细信息见 Docker 日志"], at=datetime.now(timezone.utc).isoformat())
         threading.Event().wait(interval * 60)
 
 @app.on_event("startup")
@@ -295,6 +325,7 @@ async def put_settings(value: dict[str, Any]) -> dict[str, Any]:
     value["save_mode"] = value.get("save_mode", "sidecar") if value.get("save_mode") in {"sidecar", "directory"} else "sidecar"
     value["save_path"] = value.get("save_path") or DEFAULT_SETTINGS["save_path"]
     value["lyrics_format"] = value.get("lyrics_format", "verbatim") if value.get("lyrics_format") in {"verbatim", "enhanced", "line"} else "verbatim"
+    value["filename_template"] = value.get("filename_template") or DEFAULT_SETTINGS["filename_template"]
     value["sources"] = [name for name in value.get("sources", []) if name in {"QM", "KG", "NE", "LRCLIB"}]
     if not value["sources"]:
         value["sources"] = DEFAULT_SETTINGS["sources"]
