@@ -46,6 +46,7 @@ history_file = STATE / "scrape-history.json"
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", "14400"))
 ALLOWED_ROOTS = [Path(item).resolve() for item in os.getenv("ALLOWED_ROOTS", "/music,/data,/lyrics").split(",") if item]
 sessions: dict[str, float] = {}
+scheduler_wakeup = threading.Event()
 
 class PasswordRequest(BaseModel):
     password: str
@@ -139,6 +140,23 @@ def save_history(run: dict[str, Any]) -> None:
     temp = history_file.with_suffix(".tmp")
     temp.write_text(json.dumps(history[-100:], ensure_ascii=False, indent=2), encoding="utf-8")
     temp.replace(history_file)
+
+
+def recent_log_results(current: dict[str, Any]) -> list[dict[str, str]]:
+    runs = load_history()[-10:]
+    if current.get("status") == "running":
+        runs.append(current)
+    output: list[dict[str, str]] = []
+    for run in runs:
+        trigger = "定时扫描" if run.get("trigger") == "scheduled" else "手动扫描"
+        started = run.get("at")
+        try:
+            display_time = datetime.fromisoformat(started).astimezone().strftime("%Y-%m-%d %H:%M:%S") if started else now_text()
+        except Exception:
+            display_time = now_text()
+        output.append({"time": display_time, "level": "info", "message": f"{trigger}记录"})
+        output.extend(item for item in run.get("results", []) if isinstance(item, dict))
+    return output
 
 
 saved_history = load_history()
@@ -397,8 +415,10 @@ def scheduled_scan() -> None:
     while True:
         active = load_settings()
         interval = int(active.get("interval_minutes", 0)) if active.get("schedule_enabled") else 0
-        if interval <= 0:
-            threading.Event().wait(60)
+        wait_seconds = max(interval * 60, 60) if interval > 0 else 60
+        settings_changed = scheduler_wakeup.wait(wait_seconds)
+        scheduler_wakeup.clear()
+        if settings_changed or interval <= 0:
             continue
         try:
             if lock.acquire(blocking=False):
@@ -411,7 +431,6 @@ def scheduled_scan() -> None:
         except Exception:
             log.exception("Scheduled scan failed")
             last_run.update(status="error", results=[result_item("fail", "定时扫描异常，详细信息见 Docker 日志")], at=datetime.now(timezone.utc).isoformat())
-        threading.Event().wait(interval * 60)
 
 @app.on_event("startup")
 async def startup() -> None:
@@ -452,7 +471,7 @@ async def logout(response: Response, lddc_session: str | None = Cookie(default=N
 @app.get("/api/status")
 async def status(_: None = Depends(require_auth)) -> dict[str, Any]:
     active = load_settings()
-    return {**last_run, "music_root": active["path"], "interval_minutes": active["interval_minutes"] if active["schedule_enabled"] else 0, "settings": active}
+    return {**last_run, "results": recent_log_results(last_run), "music_root": active["path"], "interval_minutes": active["interval_minutes"] if active["schedule_enabled"] else 0, "settings": active}
 
 @app.get("/api/settings")
 async def get_settings(_: None = Depends(require_auth)) -> dict[str, Any]:
@@ -479,6 +498,7 @@ async def put_settings(value: dict[str, Any], _: None = Depends(require_auth)) -
     if not value["sources"]:
         value["sources"] = DEFAULT_SETTINGS["sources"]
     app_settings = save_settings(value)
+    scheduler_wakeup.set()
     return app_settings
 
 @app.post("/api/scan")

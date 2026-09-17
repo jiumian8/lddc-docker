@@ -1,18 +1,20 @@
 services:
   lddc:
-    build: .
-    image: ghcr.io/你的用户名/lddc-docker:latest
+    image: ghcr.io/jiumian8/lddc-docker:latest
     container_name: lddc-docker
     ports:
-      - "8080:8080"
+      - "1122:8080"
     volumes:
-      # 修改左侧为宿主机音乐目录；右侧固定为容器路径
-      - "./music:/music"
+      # Linux/NAS 宿主机路径 : 容器内路径；修改左侧为实际音乐目录。
+      - "/volume2/jiumian/音乐:/music"
+      # 如需将歌词保存到独立目录，取消下一行注释并在 WebUI 填 /lyrics。
+      # - "/volume2/jiumian/歌词:/lyrics"
       - "./data:/data"
     environment:
       TZ: Asia/Shanghai
-      # 0 表示只手动扫描；例如 360 表示每 6 小时扫描一次
-      SCAN_INTERVAL_MINUTES: "360"
       MUSIC_ROOT: /music
       STATE_DIR: /data
+      ALLOWED_ROOTS: "/music,/data,/lyrics"
+      # 通过 HTTPS 反向代理访问时设置为 "true"。
+      # COOKIE_SECURE: "true"
     restart: unless-stopped

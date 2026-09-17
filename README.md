@@ -1,5 +1,7 @@
 # LDDC
 
+> 本仓库包含 jiumian 维护的 Linux/NAS Docker Web 版 **LDDC MUSIC**。部署、登录和定时刮削说明请看 [README_DOCKER.md](README_DOCKER.md)。下文是 [chenmozhijin/LDDC](https://github.com/chenmozhijin/LDDC) 原桌面项目的介绍；其中的桌面界面和功能不等于 Docker Web 版功能。
+
 中文 | [English](./README_en.md) | [日本語](./README_ja.md)
 
 [![Codacy Badge](https://app.codacy.com/project/badge/Grade/015f636391584ffc82790ff7038da5ca)](https://app.codacy.com/gh/chenmozhijin/LDDC/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
