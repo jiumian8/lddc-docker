@@ -7,4 +7,5 @@ LDDC/gui
 LDDC/res
 music/*
 data/*
+lddc-docker
 tests

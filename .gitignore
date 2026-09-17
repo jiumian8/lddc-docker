@@ -146,3 +146,6 @@ update_ts.ps1
 
 tests/artifacts/
 tests/screenshots/
+
+# Accidental nested repository copy
+/lddc-docker/
